@@ -5,13 +5,14 @@ ClearJet Pressure Washing LLC
 Scrapes business listings from Google Maps by category + zip code.
 Extracts: business name, address, phone, website, email.
 
-Strategy: Instead of relying on brittle CSS class selectors, this scraper
-uses aria-labels, data attributes, and text content patterns that survive
-Google's frequent UI reshuffles.
+Two modes:
+  1. Default (HTTP) - Uses requests + regex parsing. No browser needed.
+  2. --browser mode  - Uses Playwright for JS-rendered pages (requires: playwright install chromium)
 
 Usage:
-    python scraper.py --category "property management companies" --zipcode 38117
+    python scraper.py --category "car dealerships" --zipcode 38117
     python scraper.py --batch
+    python scraper.py --category "car dealerships" --zipcode 38117 --browser --headed
 """
 
 import argparse
@@ -20,10 +21,13 @@ import json
 import os
 import re
 import time
+import random
 import logging
 from dataclasses import dataclass, fields, asdict
 from urllib.parse import quote_plus
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
+
+import requests
+from bs4 import BeautifulSoup
 
 import config
 
@@ -33,6 +37,10 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+
+# ---------------------------------------------------------------------------
+# Data model
+# ---------------------------------------------------------------------------
 
 @dataclass
 class Lead:
@@ -46,160 +54,258 @@ class Lead:
     zipcode: str = ""
 
 
+CSV_FIELDS = [f.name for f in fields(Lead)]
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def extract_email_from_text(text: str) -> str:
-    """Find the first email address in a block of text."""
-    match = re.search(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}", text)
-    return match.group(0) if match else ""
+def extract_emails(text: str) -> list[str]:
+    """Find all email addresses in text."""
+    return re.findall(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}", text)
 
 
 def clean_phone(raw: str) -> str:
-    """Normalize a phone string."""
-    digits = re.sub(r"[^\d+]", "", raw)
-    return digits if len(digits) >= 10 else ""
+    """Extract a clean phone number."""
+    digits = re.sub(r"[^\d]", "", raw)
+    if len(digits) == 11 and digits.startswith("1"):
+        digits = digits[1:]
+    if len(digits) == 10:
+        return f"({digits[:3]}) {digits[3:6]}-{digits[6:]}"
+    return raw.strip() if raw.strip() else ""
 
 
-def build_search_url(category: str, zipcode: str) -> str:
-    query = f"{category} near {zipcode}"
-    return f"https://www.google.com/maps/search/{quote_plus(query)}"
+def random_delay(lo: float = 1.0, hi: float = 3.0) -> None:
+    """Sleep a random amount to be polite."""
+    time.sleep(random.uniform(lo, hi))
 
 
-# ---------------------------------------------------------------------------
-# Scroll the results feed
-# ---------------------------------------------------------------------------
-
-def scroll_results(page, max_scrolls: int = 20) -> None:
-    """
-    Scroll the results panel. Uses JS to find the scrollable container
-    by looking for role="feed" or the first scrollable child of role="main".
-    """
-    js_scroll = """
-    () => {
-        // Try role="feed" first (most common)
-        let feed = document.querySelector('[role="feed"]');
-        if (feed) { feed.scrollTop = feed.scrollHeight; return true; }
-        // Fallback: find scrollable divs inside role="main"
-        let main = document.querySelector('[role="main"]');
-        if (!main) return false;
-        let divs = main.querySelectorAll('div');
-        for (let d of divs) {
-            if (d.scrollHeight > d.clientHeight + 100 && d.clientHeight > 200) {
-                d.scrollTop = d.scrollHeight;
-                return true;
-            }
-        }
-        return false;
-    }
-    """
-    prev_count = 0
-    stale_rounds = 0
-
-    for i in range(max_scrolls):
-        try:
-            page.evaluate(js_scroll)
-        except Exception:
-            pass
-        time.sleep(config.SCROLL_PAUSE_SECONDS)
-
-        # Count current listings to detect when we stop getting new ones
-        links = page.query_selector_all('a[href*="/maps/place/"]')
-        if len(links) == prev_count:
-            stale_rounds += 1
-            if stale_rounds >= 3:
-                log.info("No new results after %d scrolls, stopping", i + 1)
-                return
-        else:
-            stale_rounds = 0
-            prev_count = len(links)
-
-    log.info("Finished scrolling (%d scrolls, %d listings)", max_scrolls, prev_count)
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+}
 
 
 # ---------------------------------------------------------------------------
-# Extract detail from a listing page
+# HTTP-based scraper (no browser needed)
 # ---------------------------------------------------------------------------
 
-def extract_detail_from_page(page) -> dict:
+def search_google_maps_http(category: str, zipcode: str) -> list[Lead]:
     """
-    Pull business details from the listing detail panel.
-    Uses multiple selector strategies per field for resilience.
-    """
-    info = {"address": "", "phone": "", "website": "", "email": ""}
-
-    # Give the detail panel a moment to render
-    time.sleep(1.5)
-
-    # --- ADDRESS ---
-    # Strategy 1: button with data-item-id="address"
-    addr = page.query_selector('[data-item-id="address"]')
-    if addr:
-        info["address"] = addr.inner_text().strip().split("\n")[0]
-    else:
-        # Strategy 2: aria-label containing "Address:"
-        addr2 = page.query_selector('[aria-label*="Address"]')
-        if addr2:
-            label = addr2.get_attribute("aria-label") or ""
-            info["address"] = label.replace("Address:", "").strip()
-
-    # --- PHONE ---
-    # Strategy 1: data-item-id starting with "phone"
-    phone = page.query_selector('[data-item-id^="phone"]')
-    if phone:
-        raw = phone.inner_text().strip().split("\n")[0]
-        info["phone"] = clean_phone(raw) or raw
-    else:
-        # Strategy 2: aria-label containing "Phone:"
-        phone2 = page.query_selector('[aria-label*="Phone"]')
-        if phone2:
-            label = phone2.get_attribute("aria-label") or ""
-            info["phone"] = clean_phone(label)
-
-    # --- WEBSITE ---
-    # Strategy 1: data-item-id="authority"
-    web = page.query_selector('a[data-item-id="authority"]')
-    if web:
-        info["website"] = web.get_attribute("href") or ""
-    else:
-        # Strategy 2: aria-label containing "website" (case insensitive via XPath)
-        try:
-            web2 = page.query_selector('a[aria-label*="ebsite"]')
-            if web2:
-                info["website"] = web2.get_attribute("href") or ""
-        except Exception:
-            pass
-
-    # --- EMAIL ---
-    # Emails are rare on Maps but check the full page text
-    try:
-        main = page.query_selector('[role="main"]')
-        if main:
-            text = main.inner_text()
-            info["email"] = extract_email_from_text(text)
-    except Exception:
-        pass
-
-    return info
-
-
-# ---------------------------------------------------------------------------
-# Core scrape loop
-# ---------------------------------------------------------------------------
-
-def scrape_category_zip(
-    category: str,
-    zipcode: str,
-    headless: bool = True,
-) -> list[Lead]:
-    """
-    Scrape Google Maps for one category + zip code.
-    Returns a list of Lead dataclass objects.
+    Search Google Maps via HTTP and parse the embedded JSON/text data.
+    Google Maps search results page embeds business data in the HTML even
+    without JavaScript rendering — we extract it with regex patterns.
     """
     leads: list[Lead] = []
-    url = build_search_url(category, zipcode)
-    log.info("Scraping: '%s' in %s", category, zipcode)
+    query = f"{category} near {zipcode}"
+    url = f"https://www.google.com/maps/search/{quote_plus(query)}"
+
+    log.info("HTTP scraping: '%s' in %s", category, zipcode)
+
+    session = requests.Session()
+    session.headers.update(HEADERS)
+
+    try:
+        resp = session.get(url, timeout=30)
+        resp.raise_for_status()
+        html = resp.text
+
+        # Google Maps embeds data in JS arrays. Look for the pattern that
+        # contains business listing data. The key marker is arrays starting
+        # with [null,null,... that contain business info.
+
+        # Strategy 1: Extract from window.APP_INITIALIZATION_STATE or
+        # the embedded JS data blobs
+        leads = parse_maps_html(html, category, zipcode)
+
+        if not leads:
+            # Strategy 2: Try the search page with a different endpoint
+            search_url = "https://www.google.com/search"
+            params = {
+                "q": f"{category} near {zipcode}",
+                "tbm": "lcl",  # local results
+            }
+            resp2 = session.get(search_url, params=params, timeout=30)
+            resp2.raise_for_status()
+            leads = parse_local_search_html(resp2.text, category, zipcode)
+
+    except requests.RequestException as exc:
+        log.error("HTTP request failed: %s", exc)
+
+    return leads
+
+
+def parse_maps_html(html: str, category: str, zipcode: str) -> list[Lead]:
+    """
+    Parse business data embedded in Google Maps HTML.
+    The data lives in large JS arrays within script tags.
+    """
+    leads: list[Lead] = []
+
+    # Google embeds business data in arrays that look like:
+    # [null,"Business Name",null,[null,null,lat,lng],"address",...,"phone",...,"website"]
+    # We look for patterns with phone numbers + addresses near business names.
+
+    # Find all quoted strings that look like business names near addresses
+    # Pattern: blocks containing TN zip codes (our target area)
+    blocks = re.findall(
+        r'\["([^"]{3,80})"\s*,\s*"([^"]*(?:38\d{3}|TN)[^"]*)"',
+        html,
+    )
+
+    # Also try to find structured data blocks
+    # Google Maps puts data in arrays like: ["name","address",null,null,"phone"]
+    json_blocks = re.findall(r'(\[(?:"[^"]*",?\s*){3,}\])', html)
+
+    seen: set[str] = set()
+
+    for block in json_blocks:
+        try:
+            data = json.loads(block)
+            if not isinstance(data, list) or len(data) < 3:
+                continue
+
+            # Look for arrays where items look like name, address, phone
+            strings = [s for s in data if isinstance(s, str) and len(s) > 2]
+            if len(strings) < 2:
+                continue
+
+            name = ""
+            address = ""
+            phone = ""
+            website = ""
+
+            for s in strings:
+                # Detect address (has zip code or state)
+                if re.search(r"\b\d{5}\b", s) and re.search(r"\b[A-Z]{2}\b", s):
+                    address = s
+                # Detect phone
+                elif re.search(r"\(?\d{3}\)?[\s\-.]?\d{3}[\s\-.]?\d{4}", s):
+                    phone = clean_phone(s)
+                # Detect URL
+                elif re.match(r"https?://", s):
+                    website = s
+                # Otherwise could be business name
+                elif not name and len(s) > 2 and not s.startswith("http"):
+                    name = s
+
+            if name and name not in seen:
+                seen.add(name)
+                leads.append(Lead(
+                    business_name=name,
+                    address=address,
+                    phone=phone,
+                    website=website,
+                    email="",
+                    category=category,
+                    zipcode=zipcode,
+                ))
+        except (json.JSONDecodeError, TypeError):
+            continue
+
+    # Also extract from the simpler pattern matches
+    for name, addr in blocks:
+        if name not in seen and len(name) > 2:
+            seen.add(name)
+            leads.append(Lead(
+                business_name=name,
+                address=addr,
+                phone="",
+                website="",
+                email="",
+                category=category,
+                zipcode=zipcode,
+            ))
+
+    return leads
+
+
+def parse_local_search_html(html: str, category: str, zipcode: str) -> list[Lead]:
+    """
+    Parse Google local search results (tbm=lcl).
+    These have a simpler structure than Maps.
+    """
+    leads: list[Lead] = []
+    soup = BeautifulSoup(html, "html.parser")
+    seen: set[str] = set()
+
+    # Local results are in div blocks with business info
+    # Look for common patterns in local pack results
+    for div in soup.find_all("div"):
+        text = div.get_text(separator="|", strip=True)
+
+        # Must contain a phone-like pattern or address-like pattern to be a listing
+        has_phone = re.search(r"\(?\d{3}\)?[\s\-.]?\d{3}[\s\-.]?\d{4}", text)
+        has_address = re.search(r"\b\d{5}\b", text)
+
+        if not (has_phone or has_address):
+            continue
+
+        parts = [p.strip() for p in text.split("|") if p.strip()]
+        if len(parts) < 2:
+            continue
+
+        name = ""
+        address = ""
+        phone = ""
+        website = ""
+
+        for p in parts:
+            if re.search(r"\(?\d{3}\)?[\s\-.]?\d{3}[\s\-.]?\d{4}", p) and not phone:
+                phone = clean_phone(p)
+            elif re.search(r"\b\d{5}\b", p) and re.search(r"\b[A-Z]{2}\b", p) and not address:
+                address = p
+            elif not name and len(p) > 2 and len(p) < 80:
+                name = p
+
+        if name and name not in seen:
+            seen.add(name)
+
+            # Try to find website links
+            for a_tag in div.find_all("a", href=True):
+                href = a_tag["href"]
+                if "google" not in href and href.startswith("http"):
+                    website = href
+                    break
+
+            leads.append(Lead(
+                business_name=name,
+                address=address,
+                phone=phone,
+                website=website,
+                email="",
+                category=category,
+                zipcode=zipcode,
+            ))
+
+    return leads
+
+
+# ---------------------------------------------------------------------------
+# Playwright-based scraper (optional, for when HTTP isn't enough)
+# ---------------------------------------------------------------------------
+
+def scrape_with_browser(category: str, zipcode: str, headless: bool = True) -> list[Lead]:
+    """
+    Full browser scrape using Playwright. More reliable but requires:
+        pip install playwright
+        playwright install chromium
+    """
+    try:
+        from playwright.sync_api import sync_playwright, TimeoutError as PwTimeout
+    except ImportError:
+        log.error("Playwright not installed. Run: pip install playwright && playwright install chromium")
+        return []
+
+    leads: list[Lead] = []
+    query = f"{category} near {zipcode}"
+    url = f"https://www.google.com/maps/search/{quote_plus(query)}"
+    log.info("Browser scraping: '%s' in %s", category, zipcode)
 
     with sync_playwright() as pw:
         browser = pw.chromium.launch(
@@ -209,13 +315,8 @@ def scrape_category_zip(
         context = browser.new_context(
             viewport={"width": 1280, "height": 900},
             locale="en-US",
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
+            user_agent=HEADERS["User-Agent"],
         )
-        # Hide webdriver flag
         context.add_init_script(
             "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
         )
@@ -225,107 +326,118 @@ def scrape_category_zip(
         try:
             page.goto(url, wait_until="networkidle")
 
-            # Handle consent / cookie banner if it appears
+            # Handle consent banner
             try:
-                accept_btn = page.query_selector(
-                    'button:has-text("Accept all"), '
-                    'form[action*="consent"] button'
-                )
-                if accept_btn:
-                    accept_btn.click()
+                btn = page.query_selector('button:has-text("Accept all")')
+                if btn:
+                    btn.click()
                     time.sleep(1)
             except Exception:
                 pass
 
-            # Wait for results to appear
+            # Wait for results
             try:
-                page.wait_for_selector(
-                    'a[href*="/maps/place/"]', timeout=15000
-                )
-            except PlaywrightTimeout:
-                log.warning("No results found for '%s' in %s", category, zipcode)
+                page.wait_for_selector('a[href*="/maps/place/"]', timeout=15000)
+            except PwTimeout:
+                log.warning("No results for '%s' in %s", category, zipcode)
                 browser.close()
                 return leads
 
-            # Scroll to load all results
-            scroll_results(page)
+            # Scroll results
+            prev_count = 0
+            stale = 0
+            for _ in range(20):
+                page.evaluate("""
+                    () => {
+                        let f = document.querySelector('[role="feed"]');
+                        if (f) { f.scrollTop = f.scrollHeight; return; }
+                        let m = document.querySelector('[role="main"]');
+                        if (m) for (let d of m.querySelectorAll('div'))
+                            if (d.scrollHeight > d.clientHeight + 100) {
+                                d.scrollTop = d.scrollHeight; return;
+                            }
+                    }
+                """)
+                time.sleep(config.SCROLL_PAUSE_SECONDS)
+                count = len(page.query_selector_all('a[href*="/maps/place/"]'))
+                if count == prev_count:
+                    stale += 1
+                    if stale >= 3:
+                        break
+                else:
+                    stale = 0
+                    prev_count = count
 
-            # Gather all listing links
-            listing_els = page.query_selector_all('a[href*="/maps/place/"]')
-            log.info("Found %d raw listing links", len(listing_els))
-
-            # Dedupe and collect (name, href) pairs first so DOM detach won't bite us
+            # Collect listing URLs first (avoids stale elements)
+            els = page.query_selector_all('a[href*="/maps/place/"]')
             seen: set[str] = set()
             listings: list[dict] = []
-            for el in listing_els:
+            for el in els:
                 name = (el.get_attribute("aria-label") or "").strip()
                 href = (el.get_attribute("href") or "").strip()
-                if name and name not in seen and "/maps/place/" in href:
+                if name and name not in seen:
                     seen.add(name)
                     listings.append({"name": name, "href": href})
 
-            log.info("Unique listings to process: %d", len(listings))
+            log.info("Found %d unique listings", len(listings))
 
-            for idx, listing in enumerate(listings):
-                if len(leads) >= config.SEARCH_RESULTS_LIMIT:
-                    break
-
-                name = listing["name"]
-                href = listing["href"]
-
+            # Visit each listing
+            for listing in listings[:config.SEARCH_RESULTS_LIMIT]:
                 try:
-                    # Navigate directly to the listing URL instead of clicking
-                    # This avoids stale element issues entirely
-                    page.goto(href, wait_until="domcontentloaded")
-                    time.sleep(config.DETAIL_LOAD_DELAY_MS / 1000)
+                    page.goto(listing["href"], wait_until="domcontentloaded")
+                    time.sleep(2)
 
-                    detail = extract_detail_from_page(page)
+                    info = {"address": "", "phone": "", "website": "", "email": ""}
 
-                    lead = Lead(
-                        business_name=name,
-                        address=detail["address"],
-                        phone=detail["phone"],
-                        website=detail["website"],
-                        email=detail["email"],
+                    # Address
+                    el = page.query_selector('[data-item-id="address"]')
+                    if el:
+                        info["address"] = el.inner_text().strip().split("\n")[0]
+
+                    # Phone
+                    el = page.query_selector('[data-item-id^="phone"]')
+                    if el:
+                        info["phone"] = clean_phone(el.inner_text().strip().split("\n")[0])
+
+                    # Website
+                    el = page.query_selector('a[data-item-id="authority"]')
+                    if el:
+                        info["website"] = el.get_attribute("href") or ""
+
+                    # Email from page text
+                    main = page.query_selector('[role="main"]')
+                    if main:
+                        emails = extract_emails(main.inner_text())
+                        info["email"] = emails[0] if emails else ""
+
+                    leads.append(Lead(
+                        business_name=listing["name"],
+                        address=info["address"],
+                        phone=info["phone"],
+                        website=info["website"],
+                        email=info["email"],
                         category=category,
                         zipcode=zipcode,
-                    )
-                    leads.append(lead)
-                    log.info(
-                        "  [%d/%d] %s | %s | %s",
-                        len(leads), len(listings),
-                        name,
-                        detail["phone"] or "no phone",
-                        detail["website"] or "no website",
-                    )
+                    ))
+                    log.info("  [%d] %s", len(leads), listing["name"])
 
-                except (PlaywrightTimeout, Exception) as exc:
-                    log.warning("  Skipping '%s': %s", name, exc)
-                    continue
+                except Exception as exc:
+                    log.warning("  Skip '%s': %s", listing["name"], exc)
 
-            # After processing all listings, go back for a clean state
-            # (useful if this function is called in a loop)
-
-        except PlaywrightTimeout:
-            log.error("Page timed out for '%s' in %s", category, zipcode)
         except Exception as exc:
-            log.error("Unexpected error: %s", exc)
+            log.error("Browser error: %s", exc)
         finally:
             browser.close()
 
-    log.info("Collected %d leads for '%s' in %s", len(leads), category, zipcode)
     return leads
 
 
 # ---------------------------------------------------------------------------
-# CSV helpers
+# CSV output
 # ---------------------------------------------------------------------------
 
-CSV_FIELDS = [f.name for f in fields(Lead)]
-
-
 def save_leads_csv(leads: list[Lead], filepath: str) -> None:
-    """Write leads to a CSV file. Appends if file exists."""
+    """Write leads to CSV. Appends if file exists."""
     file_exists = os.path.isfile(filepath)
     with open(filepath, "a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
@@ -333,11 +445,11 @@ def save_leads_csv(leads: list[Lead], filepath: str) -> None:
             writer.writeheader()
         for lead in leads:
             writer.writerow(asdict(lead))
-    log.info("Saved %d leads to %s", len(leads), filepath)
+    log.info("Saved %d leads -> %s", len(leads), filepath)
 
 
 def deduplicate_leads(leads: list[Lead]) -> list[Lead]:
-    """Remove duplicates by business name + address."""
+    """Remove dupes by business name + address."""
     seen: set[str] = set()
     unique: list[Lead] = []
     for lead in leads:
@@ -358,48 +470,56 @@ def main():
     )
     parser.add_argument("--category", type=str, help="Business category to search")
     parser.add_argument("--zipcode", type=str, help="Zip code to search in")
-    parser.add_argument(
-        "--batch", action="store_true",
-        help="Run all category x zip combos from config.py",
-    )
-    parser.add_argument(
-        "--headed", action="store_true",
-        help="Show the browser window (useful for debugging)",
-    )
+    parser.add_argument("--batch", action="store_true", help="Run all combos from config")
+    parser.add_argument("--browser", action="store_true", help="Use Playwright browser mode")
+    parser.add_argument("--headed", action="store_true", help="Show browser (only with --browser)")
     args = parser.parse_args()
 
     os.makedirs(config.OUTPUT_DIR, exist_ok=True)
-    headless = not args.headed
+
+    # Pick scrape function
+    if args.browser:
+        scrape_fn = lambda cat, zc: scrape_with_browser(cat, zc, headless=not args.headed)
+    else:
+        scrape_fn = search_google_maps_http
 
     all_leads: list[Lead] = []
 
     if args.batch:
+        total = len(config.BUSINESS_CATEGORIES) * len(config.TARGET_ZIP_CODES)
+        done = 0
         for cat in config.BUSINESS_CATEGORIES:
             for zc in config.TARGET_ZIP_CODES:
-                leads = scrape_category_zip(cat, zc, headless=headless)
+                done += 1
+                log.info("--- Job %d/%d ---", done, total)
+                leads = scrape_fn(cat, zc)
                 all_leads.extend(leads)
                 fname = config.CSV_FILENAME_TEMPLATE.format(
                     category=cat.replace(" ", "_"), zipcode=zc,
                 )
-                save_leads_csv(leads, os.path.join(config.OUTPUT_DIR, fname))
+                if leads:
+                    save_leads_csv(leads, os.path.join(config.OUTPUT_DIR, fname))
+                random_delay(2, 5)  # Don't hammer Google
 
     elif args.category and args.zipcode:
-        leads = scrape_category_zip(args.category, args.zipcode, headless=headless)
+        leads = scrape_fn(args.category, args.zipcode)
         all_leads.extend(leads)
         fname = config.CSV_FILENAME_TEMPLATE.format(
             category=args.category.replace(" ", "_"), zipcode=args.zipcode,
         )
-        save_leads_csv(leads, os.path.join(config.OUTPUT_DIR, fname))
+        if leads:
+            save_leads_csv(leads, os.path.join(config.OUTPUT_DIR, fname))
 
     else:
         parser.error("Provide --category and --zipcode, or use --batch")
 
     # Combined deduplicated output
     all_leads = deduplicate_leads(all_leads)
-    combined_path = os.path.join(config.OUTPUT_DIR, config.COMBINED_CSV_FILENAME)
-    if os.path.exists(combined_path):
-        os.remove(combined_path)
-    save_leads_csv(all_leads, combined_path)
+    combined = os.path.join(config.OUTPUT_DIR, config.COMBINED_CSV_FILENAME)
+    if os.path.exists(combined):
+        os.remove(combined)
+    if all_leads:
+        save_leads_csv(all_leads, combined)
 
     log.info("Done. Total unique leads: %d", len(all_leads))
 
