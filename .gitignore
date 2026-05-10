@@ -1,0 +1,8 @@
+output/
+__pycache__/
+*.pyc
+.env
+outreach.db
+*.egg-info/
+venv/
+.venv/
