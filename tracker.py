@@ -11,11 +11,24 @@ outreach_log — one row per email step sent to a lead
 """
 
 import csv
+import logging
+import math
 import sqlite3
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from geopy.geocoders import Nominatim
+from geopy.exc import GeocoderTimedOut, GeocoderServiceError
+
 DB_PATH = "outreach.db"
+
+# Collierville, TN — centre of the 250-mile service radius
+ORIGIN_LAT = 35.0423
+ORIGIN_LON = -89.6645
+MAX_RADIUS_MILES = 250
+
+log = logging.getLogger(__name__)
 
 FOLLOW_UP_1_DAYS = 3   # days after initial before first follow-up
 FOLLOW_UP_2_DAYS = 7   # days after follow-up 1 before final follow-up
@@ -30,6 +43,8 @@ CREATE TABLE IF NOT EXISTS leads (
     email         TEXT NOT NULL,
     category      TEXT DEFAULT '',
     zipcode       TEXT DEFAULT '',
+    lat           REAL DEFAULT NULL,
+    lon           REAL DEFAULT NULL,
     imported_at   TEXT DEFAULT (datetime('now')),
     status        TEXT DEFAULT 'new'
     -- status values: new | active | unsubscribed | closed
@@ -55,9 +70,31 @@ def _conn() -> sqlite3.Connection:
     return conn
 
 
+def _haversine_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    R = 3958.8
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlam = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlam / 2) ** 2
+    return R * 2 * math.asin(math.sqrt(a))
+
+
+def _within_radius(row: sqlite3.Row) -> bool:
+    lat, lon = row["lat"], row["lon"]
+    if lat is None or lon is None:
+        return False
+    return _haversine_miles(ORIGIN_LAT, ORIGIN_LON, lat, lon) <= MAX_RADIUS_MILES
+
+
 def init_db() -> None:
     with _conn() as conn:
         conn.executescript(_SCHEMA)
+        # Migrate existing DBs that predate the lat/lon columns
+        for col in ("lat", "lon"):
+            try:
+                conn.execute(f"ALTER TABLE leads ADD COLUMN {col} REAL DEFAULT NULL")
+            except sqlite3.OperationalError:
+                pass  # column already exists
 
 
 def import_leads(csv_path: str) -> int:
@@ -91,28 +128,56 @@ def import_leads(csv_path: str) -> int:
     return imported
 
 
-def get_pending_leads(limit: int = 25) -> list[sqlite3.Row]:
-    """Leads that have not yet received an initial email."""
+def geocode_leads() -> int:
+    """Geocode leads that have an address but no lat/lon. Returns count geocoded."""
     with _conn() as conn:
-        return conn.execute(
+        rows = conn.execute(
+            "SELECT id, address FROM leads WHERE lat IS NULL AND address != ''"
+        ).fetchall()
+
+    if not rows:
+        return 0
+
+    geolocator = Nominatim(user_agent="clearjet-outreach/1.0")
+    geocoded = 0
+    for row in rows:
+        try:
+            location = geolocator.geocode(row["address"], timeout=10)
+            if location:
+                with _conn() as conn:
+                    conn.execute(
+                        "UPDATE leads SET lat = ?, lon = ? WHERE id = ?",
+                        (location.latitude, location.longitude, row["id"]),
+                    )
+                geocoded += 1
+            time.sleep(1.1)  # Nominatim rate limit: 1 req/sec
+        except (GeocoderTimedOut, GeocoderServiceError):
+            pass
+
+    return geocoded
+
+
+def get_pending_leads(limit: int = 25) -> list[sqlite3.Row]:
+    """Leads that have not yet received an initial email and are within the service radius."""
+    with _conn() as conn:
+        rows = conn.execute(
             """SELECT l.*
                FROM   leads l
                WHERE  l.status = 'new'
                AND    NOT EXISTS (
                           SELECT 1 FROM outreach_log ol
                           WHERE  ol.lead_id = l.id AND ol.step = 'initial'
-                      )
-               LIMIT  ?""",
-            (limit,),
+                      )"""
         ).fetchall()
+    return [r for r in rows if _within_radius(r)][:limit]
 
 
 def get_due_follow_ups(step: str) -> list[sqlite3.Row]:
-    """Leads where the given follow-up step is due and has not been sent yet."""
+    """Leads where the given follow-up step is due, not yet sent, and within the service radius."""
     prev = "initial" if step == "follow_up_1" else "follow_up_1"
     now = datetime.utcnow().isoformat()
     with _conn() as conn:
-        return conn.execute(
+        rows = conn.execute(
             """SELECT l.*
                FROM   leads l
                JOIN   outreach_log prev_log ON prev_log.lead_id = l.id
@@ -125,6 +190,7 @@ def get_due_follow_ups(step: str) -> list[sqlite3.Row]:
                       )""",
             (prev, now, step),
         ).fetchall()
+    return [r for r in rows if _within_radius(r)]
 
 
 def log_sent(lead_id: int, step: str) -> None:

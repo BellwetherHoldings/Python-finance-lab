@@ -247,6 +247,11 @@ def main() -> None:
         tracker.log_unsubscribe(args.unsubscribe)
         log.info("Lead %d marked as unsubscribed", args.unsubscribe)
 
+    if args.send or args.follow_ups:
+        n = tracker.geocode_leads()
+        if n:
+            log.info("Geocoded %d new leads", n)
+
     if args.send:
         send_initial(dry_run=args.dry_run)
 
