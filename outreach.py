@@ -35,6 +35,7 @@ import logging
 import os
 import smtplib
 import string
+import sys
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
@@ -181,7 +182,7 @@ def _send(to_email: str, subject: str, body: str) -> bool:
 # Send actions
 # ---------------------------------------------------------------------------
 
-def send_initial(dry_run: bool = False) -> None:
+def send_initial(dry_run: bool = False) -> tuple[int, int]:
     leads = tracker.get_pending_leads(limit=DAILY_LIMIT)
     log.info("Initial sends: %d leads queued (daily limit %d)", len(leads), DAILY_LIMIT)
     subj_tpl, body_tpl = _TEMPLATES["initial"]
@@ -200,9 +201,10 @@ def send_initial(dry_run: bool = False) -> None:
             else:
                 log.warning("Failed: %s", d["email"])
     log.info("Done — sent %d/%d", sent, len(leads))
+    return sent, len(leads)
 
 
-def send_follow_ups(step: str, dry_run: bool = False) -> None:
+def send_follow_ups(step: str, dry_run: bool = False) -> tuple[int, int]:
     leads = tracker.get_due_follow_ups(step)
     log.info("%s: %d leads due", step, len(leads))
     subj_tpl, body_tpl = _TEMPLATES[step]
@@ -221,6 +223,7 @@ def send_follow_ups(step: str, dry_run: bool = False) -> None:
             else:
                 log.warning("Failed: %s", d["email"])
     log.info("Done — sent %d/%d", sent, len(leads))
+    return sent, len(leads)
 
 
 # ---------------------------------------------------------------------------
@@ -235,9 +238,30 @@ def main() -> None:
     parser.add_argument("--stats",         action="store_true", help="Print pipeline stats")
     parser.add_argument("--unsubscribe",   metavar="LEAD_ID", type=int, help="Mark a lead as unsubscribed")
     parser.add_argument("--dry-run",       action="store_true", help="Preview emails without sending")
+    parser.add_argument("--smtp-test",     action="store_true", help="Test SMTP credentials and exit")
     args = parser.parse_args()
 
+    if args.smtp_test:
+        if not EMAIL_FROM or not EMAIL_PASSWORD:
+            log.error("EMAIL_FROM and EMAIL_PASSWORD not set.")
+            sys.exit(1)
+        try:
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as srv:
+                srv.ehlo()
+                srv.starttls()
+                srv.login(EMAIL_FROM, EMAIL_PASSWORD)
+            log.info("SMTP connection successful (%s:%d)", SMTP_HOST, SMTP_PORT)
+            sys.exit(0)
+        except smtplib.SMTPException as exc:
+            log.error("SMTP test failed: %s", exc)
+            sys.exit(1)
+
     tracker.init_db()
+
+    if (args.send or args.follow_ups) and not args.dry_run:
+        if not EMAIL_FROM or not EMAIL_PASSWORD:
+            log.error("EMAIL_FROM and EMAIL_PASSWORD must be set. Aborting.")
+            sys.exit(2)
 
     if args.import_csv:
         n = tracker.import_leads(args.import_csv)
@@ -252,12 +276,18 @@ def main() -> None:
         if n:
             log.info("Geocoded %d new leads", n)
 
+    had_failure = False
+
     if args.send:
-        send_initial(dry_run=args.dry_run)
+        sent, total = send_initial(dry_run=args.dry_run)
+        if not args.dry_run and total > 0 and sent == 0:
+            had_failure = True
 
     if args.follow_ups:
-        send_follow_ups("follow_up_1", dry_run=args.dry_run)
-        send_follow_ups("follow_up_2", dry_run=args.dry_run)
+        for step in ("follow_up_1", "follow_up_2"):
+            sent, total = send_follow_ups(step, dry_run=args.dry_run)
+            if not args.dry_run and total > 0 and sent == 0:
+                had_failure = True
 
     if args.stats:
         stats = tracker.get_stats()
@@ -265,6 +295,9 @@ def main() -> None:
         for key, val in stats.items():
             print(f"  {key:<20} {val}")
         print()
+
+    if had_failure:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

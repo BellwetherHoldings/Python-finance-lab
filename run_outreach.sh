@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-DIR="/home/user/Python-finance-lab"
+DIR="$(cd "$(dirname "$0")" && pwd)"
 LOG="$DIR/outreach.log"
 
 echo "=== $(date) ===" >> "$LOG"
