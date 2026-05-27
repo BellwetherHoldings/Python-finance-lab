@@ -54,6 +54,7 @@ Would you be open to a quick call this week to see if we can help?
 Best,
 Jakob Tillman
 ClearJet Pressure Washing LLC
+clearjetpressurewashing.com
 """,
         },
         # Touch 2: Value add
@@ -70,6 +71,7 @@ Would it make sense to set up a free walkthrough of your property? No commitment
 Best,
 Jakob Tillman
 ClearJet Pressure Washing LLC
+clearjetpressurewashing.com
 """,
         },
         # Touch 3: Social proof
@@ -86,6 +88,7 @@ I'd love to do the same for {business_name}. Can I send over a quick quote?
 Best,
 Jakob Tillman
 ClearJet Pressure Washing LLC
+clearjetpressurewashing.com
 """,
         },
         # Touch 4: Direct ask
@@ -102,6 +105,7 @@ What does your schedule look like this week?
 Best,
 Jakob Tillman
 ClearJet Pressure Washing LLC
+clearjetpressurewashing.com
 """,
         },
         # Touch 5: Breakup
@@ -117,6 +121,7 @@ Wishing you and {business_name} all the best.
 
 Jakob Tillman
 ClearJet Pressure Washing LLC
+clearjetpressurewashing.com
 """,
         },
     ]
